@@ -11,7 +11,9 @@ import logging
 import asyncio
 import re
 import uuid
-from datetime import datetime, timezone
+import time
+import hashlib
+from datetime import datetime, timezone, timedelta
 import httpx
 from contextlib import asynccontextmanager
 from starlette.applications import Starlette
@@ -51,7 +53,36 @@ def get_client() -> httpx.AsyncClient:
     return _client
 
 
-async def get_xinchao_context() -> str:
+CN_TZ = timezone(timedelta(hours=8))
+_UTC_TS = re.compile(r'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z)')
+
+def _utc_to_cn(match):
+    try:
+        dt = datetime.fromisoformat(match.group(1).replace('Z', '+00:00'))
+        return dt.astimezone(CN_TZ).strftime('%Y-%m-%d %H:%M:%S')
+    except ValueError:
+        return match.group(1)
+
+def normalize_timestamps(text):
+    """把注入文本里的 UTC 时间戳统一转为北京时间，避免与 OB 侧本地时间混用时区。"""
+    return _UTC_TS.sub(_utc_to_cn, text)
+
+_last_window_fp = {"fp": ""}
+
+def _window_fp(messages):
+    for m in messages or []:
+        if isinstance(m, dict) and m.get("role") == "user":
+            return hashlib.sha256(str(m.get("content") or "").encode("utf-8", "ignore")).hexdigest()[:16]
+    return ""
+
+def _session_for_request(messages, default_sid):
+    fp = _window_fp(messages)
+    if fp and fp != _last_window_fp["fp"]:
+        _last_window_fp["fp"] = fp
+        return f"{default_sid}-{int(time.time())}"
+    return default_sid
+
+async def get_xinchao_context(session_id: str = '') -> str:
     """从心潮 /v1/context 获取 Context Envelope（mode=turn，轻量，不含 OB 长期记忆）。"""
     if not XINCHAO_TOKEN:
         return ""
@@ -59,7 +90,7 @@ async def get_xinchao_context() -> str:
         client = get_client()
         context_resp = await client.get(
             f"{XINCHAO_URL}/v1/context",
-            params={"mode": "turn", "max_tokens": 1200},
+            params={"mode": "turn", "max_tokens": 1200, **({"session_id": session_id} if session_id else {})},
             headers={"Authorization": f"Bearer {XINCHAO_TOKEN}"},
         )
         if context_resp.status_code != 200:
@@ -74,7 +105,7 @@ async def get_xinchao_context() -> str:
         tokens = data.get("estimatedTokens", 0)
         sections = [s.get("id", "") for s in (data.get("sections") or [])]
         logger.info("xinchao context | tokens=%d sections=%s", tokens, ",".join(sections))
-        return ctx_text
+        return normalize_timestamps(ctx_text)
     except Exception as exc:
         logger.warning("xinchao context failed: %s", exc)
         return ""
@@ -89,6 +120,8 @@ def build_handoff_note(messages: list[dict]) -> str | None:
     for msg in reversed(messages):
         role = str(msg.get("role", "")).strip()
         content_text = str(msg.get("content", "")).strip()
+        if not content_text or content_text.startswith("<status"):
+            continue
         if not last_assistant and role == "assistant":
             last_assistant = content_text
         if not last_user and role == "user":
@@ -212,7 +245,9 @@ async def chat_completions(request: Request) -> JSONResponse | StreamingResponse
     stream = body.get("stream", False)
 
     # Fetch xinchao state
-    xinchao_text = await get_xinchao_context()
+    sess_id = request.headers.get("x-ombre-session-id", "")
+    ctx_session = _session_for_request(body.get("messages"), sess_id or "default")
+    xinchao_text = await get_xinchao_context(ctx_session)
     if xinchao_text:
         logger.info("xinchao context injected | chars=%d", len(xinchao_text))
 
